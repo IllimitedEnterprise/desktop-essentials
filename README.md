@@ -1,5 +1,5 @@
 # Windows Desktop Hardening & Threat-Hunt Runbook
-> Hand this to your System Admin Agent, with elevated permissions.
+> #Hand this to your System Admin Agent, with elevated permissions.
 
 > **Audience:** an autonomous agent tasked with assessing and hardening a Windows 10/11 desktop.
 > **Goal:** lock down remote access, remove bloat, and run a manual threat hunt (processes, persistence, DLL injection) **without relying solely on Windows Defender's verdict**.
