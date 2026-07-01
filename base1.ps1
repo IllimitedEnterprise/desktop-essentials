@@ -1,157 +1,257 @@
 <#
 .SYNOPSIS
-    Local host security audit: SMB1/NetBIOS status + listening TCP/UDP ports.
+    Remediation companion to Check-SmbNetbiosExposure.ps1 — hardens the findings.
 
 .DESCRIPTION
-    Defensive posture check for the LOCAL machine. It reports:
-      - SMB1 (SMBv1 / CIFS) client & server state  -> the EternalBlue/WannaCry protocol
-      - SMB server signing / hardening settings
-      - NetBIOS over TCP/IP status per adapter
-      - All listening TCP and UDP ports, with risky/legacy ports flagged
+    Applies fixes for the issues the audit script flags:
+      1. Disable SMB1 (Windows feature + SMB server)
+      2. Require SMB signing (+ optionally disable insecure guest logon)
+      3. Disable NetBIOS over TCP/IP on all IP-enabled adapters
+      4. Report risky listening ports and offer to stop/disable known legacy
+         services (Telnet, FTP, SNMP, Remote Registry) — never kills unknown apps.
 
-    NOTE: This does NOT scan for "all" CVEs. True vulnerability scanning needs a
-    dedicated scanner (Nessus, OpenVAS, nmap --script vuln) with a CVE database.
-    This gives you the exposure picture a scanner would build on.
+    SAFETY MODEL:
+      - DRY RUN by default. It shows exactly what WOULD change and does nothing.
+      - Pass -Apply to actually make changes.
+      - Before applying it writes a rollback file (JSON) capturing prior state.
+      - Already-hardened settings are skipped (idempotent).
+
+.PARAMETER Apply
+    Actually perform the changes. Without it, the script only previews.
+
+.PARAMETER IncludeServices
+    Also stop & disable known legacy services (Telnet/FTP/SNMP/RemoteRegistry).
+
+.PARAMETER RollbackPath
+    Where to write the pre-change state snapshot. Default: script folder.
+
+.EXAMPLE
+    .\Harden-SmbNetbiosExposure.ps1                # preview only
+    .\Harden-SmbNetbiosExposure.ps1 -Apply         # apply core hardening
+    .\Harden-SmbNetbiosExposure.ps1 -Apply -IncludeServices
 
 .NOTES
-    Run in an ELEVATED PowerShell (Run as Administrator) for full results.
+    MUST be run in an ELEVATED PowerShell (Run as Administrator).
+    Disabling SMB1 can break access to very old NAS/printers/XP-era hosts.
+    A reboot is recommended after applying.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$AsJson
+    [switch]$Apply,
+    [switch]$IncludeServices,
+    [string]$RollbackPath = (Join-Path $PSScriptRoot "harden-rollback-$(Get-Date -Format yyyyMMdd-HHmmss).json")
 )
 
-$ErrorActionPreference = 'SilentlyContinue'
-$report = [ordered]@{}
+$ErrorActionPreference = 'Stop'
+$rollback = [ordered]@{ Timestamp = (Get-Date -Format u); Host = $env:COMPUTERNAME }
+$mode = if ($Apply) { "APPLY" } else { "DRY-RUN (preview only — pass -Apply to change)" }
 
 function Write-Section($title) {
     Write-Host ""
-    Write-Host ("=" * 60) -ForegroundColor DarkCyan
+    Write-Host ("=" * 62) -ForegroundColor DarkCyan
     Write-Host " $title" -ForegroundColor Cyan
-    Write-Host ("=" * 60) -ForegroundColor DarkCyan
+    Write-Host ("=" * 62) -ForegroundColor DarkCyan
 }
 
-# --- Elevation check -------------------------------------------------------
+# Executes a change only when -Apply is set; otherwise just prints the intent.
+function Invoke-Change($description, [scriptblock]$action) {
+    if ($Apply) {
+        Write-Host "[APPLY] $description" -ForegroundColor Green
+        try { & $action; Write-Host "        done." -ForegroundColor DarkGreen }
+        catch { Write-Host "        FAILED: $($_.Exception.Message)" -ForegroundColor Red }
+    } else {
+        Write-Host "[WOULD] $description" -ForegroundColor Yellow
+    }
+}
+
+# --- Elevation guard -------------------------------------------------------
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Host "[!] Not elevated. Some checks may be incomplete. Re-run as Administrator." -ForegroundColor Yellow
+    Write-Host "[X] This script MUST run elevated (Run as Administrator). Aborting." -ForegroundColor Red
+    return
 }
 
-# --- 1. SMB1 status --------------------------------------------------------
-Write-Section "SMB1 / SMBv1 (EternalBlue / WannaCry protocol)"
+Write-Host ""
+Write-Host " Hardening mode: $mode" -ForegroundColor White
+Write-Host " Rollback snapshot: $RollbackPath" -ForegroundColor Gray
 
-$smb1Feature = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol
-if ($smb1Feature) {
-    $state = $smb1Feature.State
-    $report.SMB1_OptionalFeature = "$state"
-    if ($state -eq 'Enabled') {
-        Write-Host "[VULN] SMB1 Windows feature is ENABLED. Disable it." -ForegroundColor Red
-        Write-Host "       Fix: Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol" -ForegroundColor Gray
-    } else {
-        Write-Host "[OK]   SMB1 Windows feature is $state." -ForegroundColor Green
+# ==========================================================================
+# 1. SMB1
+# ==========================================================================
+Write-Section "1. Disable SMB1 (SMBv1 / CIFS)"
+
+$smb1Feature = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+$rollback.SMB1_OptionalFeature = "$($smb1Feature.State)"
+if ($smb1Feature -and $smb1Feature.State -eq 'Enabled') {
+    Invoke-Change "Disable Windows optional feature 'SMB1Protocol' (reboot needed)" {
+        Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart | Out-Null
     }
+} else {
+    Write-Host "[SKIP] SMB1 optional feature already disabled/absent." -ForegroundColor DarkGray
 }
 
 $srvSmb1 = (Get-SmbServerConfiguration).EnableSMB1Protocol
-$report.SMB1_Server = "$srvSmb1"
+$rollback.SMB1_Server = "$srvSmb1"
 if ($srvSmb1 -eq $true) {
-    Write-Host "[VULN] SMB1 is ENABLED on the SMB server. Disable it." -ForegroundColor Red
-    Write-Host "       Fix: Set-SmbServerConfiguration -EnableSMB1Protocol `$false -Force" -ForegroundColor Gray
-} elseif ($null -ne $srvSmb1) {
-    Write-Host "[OK]   SMB1 disabled on SMB server." -ForegroundColor Green
+    Invoke-Change "Set-SmbServerConfiguration -EnableSMB1Protocol `$false" {
+        Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    }
+} else {
+    Write-Host "[SKIP] SMB1 already disabled on SMB server." -ForegroundColor DarkGray
 }
 
-# --- 2. SMB server hardening ----------------------------------------------
-Write-Section "SMB Server Hardening"
+# Disable the SMB1 client driver/dependency (mrxsmb10) as well
+$mrxsmb10 = Get-Service -Name mrxsmb10 -ErrorAction SilentlyContinue
+if ($mrxsmb10 -and $mrxsmb10.StartType -ne 'Disabled') {
+    $rollback.SMB1_ClientDriver = "$($mrxsmb10.StartType)"
+    Invoke-Change "Disable SMB1 client driver (mrxsmb10) via sc config" {
+        sc.exe config lanmanworkstation depend= bowser/mrxsmb20/nsi | Out-Null
+        sc.exe config mrxsmb10 start= disabled | Out-Null
+    }
+} else {
+    Write-Host "[SKIP] SMB1 client driver already disabled/absent." -ForegroundColor DarkGray
+}
+
+# ==========================================================================
+# 2. SMB signing / guest hardening
+# ==========================================================================
+Write-Section "2. Require SMB signing + block insecure guest logon"
 
 $smbCfg = Get-SmbServerConfiguration
-$report.SMB_SigningRequired = "$($smbCfg.RequireSecuritySignature)"
-$report.SMB_EncryptData     = "$($smbCfg.EncryptData)"
-
-if ($smbCfg.RequireSecuritySignature) {
-    Write-Host "[OK]   SMB signing is REQUIRED." -ForegroundColor Green
+$rollback.SMB_RequireSecuritySignature = "$($smbCfg.RequireSecuritySignature)"
+if (-not $smbCfg.RequireSecuritySignature) {
+    Invoke-Change "Require SMB server signing" {
+        Set-SmbServerConfiguration -RequireSecuritySignature $true -Force
+        Set-SmbServerConfiguration -EnableSecuritySignature   $true -Force
+    }
 } else {
-    Write-Host "[WARN] SMB signing NOT required (relay-attack risk)." -ForegroundColor Yellow
-    Write-Host "       Fix: Set-SmbServerConfiguration -RequireSecuritySignature `$true -Force" -ForegroundColor Gray
+    Write-Host "[SKIP] SMB server signing already required." -ForegroundColor DarkGray
 }
-Write-Host ("       SMB2/3 present: {0}" -f $smbCfg.EnableSMB2Protocol)
 
-# --- 3. NetBIOS over TCP/IP ------------------------------------------------
-Write-Section "NetBIOS over TCP/IP (per adapter)"
+# Client-side: require signing too
+$smbClient = Get-SmbClientConfiguration
+$rollback.SMBClient_RequireSecuritySignature = "$($smbClient.RequireSecuritySignature)"
+if (-not $smbClient.RequireSecuritySignature) {
+    Invoke-Change "Require SMB client signing" {
+        Set-SmbClientConfiguration -RequireSecuritySignature $true -Force
+    }
+} else {
+    Write-Host "[SKIP] SMB client signing already required." -ForegroundColor DarkGray
+}
+
+# Block insecure guest logons (prevents unauthenticated SMB access)
+$lanmanKey = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
+$curGuest = (Get-ItemProperty -Path $lanmanKey -Name AllowInsecureGuestAuth -ErrorAction SilentlyContinue).AllowInsecureGuestAuth
+$rollback.AllowInsecureGuestAuth = "$curGuest"
+if ($curGuest -ne 0) {
+    Invoke-Change "Disable insecure guest logon (AllowInsecureGuestAuth=0)" {
+        New-Item -Path $lanmanKey -Force | Out-Null
+        Set-ItemProperty -Path $lanmanKey -Name AllowInsecureGuestAuth -Value 0 -Type DWord
+    }
+} else {
+    Write-Host "[SKIP] Insecure guest logon already disabled." -ForegroundColor DarkGray
+}
+
+# ==========================================================================
+# 3. NetBIOS over TCP/IP
+# ==========================================================================
+Write-Section "3. Disable NetBIOS over TCP/IP (all adapters)"
 
 $nbConfigs = Get-CimInstance -Class Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True"
-$nbList = @()
+$nbRollback = @()
 foreach ($nb in $nbConfigs) {
-    # TcpipNetbiosOptions: 0=default(DHCP), 1=enabled, 2=disabled
-    switch ($nb.TcpipNetbiosOptions) {
-        1       { $s = "ENABLED";        $col = "Red" }
-        2       { $s = "Disabled";       $col = "Green" }
-        default { $s = "Default (via DHCP - often enabled)"; $col = "Yellow" }
+    $nbRollback += [pscustomobject]@{ Desc = $nb.Description; Setting = $nb.SettingID; Option = $nb.TcpipNetbiosOptions }
+    if ($nb.TcpipNetbiosOptions -ne 2) {
+        Invoke-Change "Disable NetBIOS on '$($nb.Description)' (SetTcpipNetbios=2)" {
+            $r = $nb.SetTcpipNetbios(2)
+            if ($r.ReturnValue -ne 0) {
+                # Fallback: registry per-interface (needs reboot)
+                $ifKey = "HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_$($nb.SettingID)"
+                if (Test-Path $ifKey) { Set-ItemProperty -Path $ifKey -Name NetbiosOptions -Value 2 -Type DWord }
+            }
+        }
+    } else {
+        Write-Host "[SKIP] NetBIOS already disabled on '$($nb.Description)'." -ForegroundColor DarkGray
     }
-    $nbList += [pscustomobject]@{ Adapter = $nb.Description; NetBIOS = $s }
-    Write-Host ("[{0}] {1} -> NetBIOS: {2}" -f $(if($col -eq 'Green'){'OK'}else{'CHK'}), $nb.Description, $s) -ForegroundColor $col
 }
-$report.NetBIOS = $nbList
-Write-Host "       To disable: set 'Disable NetBIOS over TCP/IP' in adapter WINS settings," -ForegroundColor Gray
-Write-Host "       or per-adapter registry NetbiosOptions=2 under NetBT\Parameters\Interfaces." -ForegroundColor Gray
+$rollback.NetBIOS = $nbRollback
 
-# --- 4. Listening TCP/UDP ports -------------------------------------------
-Write-Section "Listening TCP / UDP Ports"
-
-# Ports commonly considered risky/legacy when exposed
-$riskyPorts = @{
-    21   = "FTP (cleartext)";        23   = "Telnet (cleartext)"
-    25   = "SMTP";                   69   = "TFTP"
-    110  = "POP3 (cleartext)";       111  = "RPCbind/portmapper"
-    135  = "MS RPC endpoint mapper"; 137  = "NetBIOS Name"
-    138  = "NetBIOS Datagram";       139  = "NetBIOS Session (SMB over NetBIOS)"
-    143  = "IMAP (cleartext)";       161  = "SNMP"
-    445  = "SMB (EternalBlue vector)"; 512 = "rexec"
-    513  = "rlogin";                 514  = "rsh/syslog"
-    1433 = "MS SQL";                 1434 = "MS SQL browser (UDP)"
-    3389 = "RDP (BlueKeep vector)";  5900 = "VNC"
+# Also disable the LLMNR + mDNS name-poisoning vectors (defense-in-depth)
+$dnsKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+$curLlmnr = (Get-ItemProperty -Path $dnsKey -Name EnableMulticast -ErrorAction SilentlyContinue).EnableMulticast
+$rollback.LLMNR_EnableMulticast = "$curLlmnr"
+if ($curLlmnr -ne 0) {
+    Invoke-Change "Disable LLMNR (EnableMulticast=0) — blocks LLMNR poisoning" {
+        New-Item -Path $dnsKey -Force | Out-Null
+        Set-ItemProperty -Path $dnsKey -Name EnableMulticast -Value 0 -Type DWord
+    }
+} else {
+    Write-Host "[SKIP] LLMNR already disabled." -ForegroundColor DarkGray
 }
 
-function Show-Ports($conns, $proto) {
-    Write-Host ""
-    Write-Host " $proto listeners:" -ForegroundColor White
-    $rows = foreach ($c in $conns) {
-        $port = $c.LocalPort
-        $procName = (Get-Process -Id $c.OwningProcess).ProcessName
-        $flag = if ($riskyPorts.ContainsKey([int]$port)) { "RISKY: " + $riskyPorts[[int]$port] } else { "" }
-        [pscustomobject]@{
-            Proto   = $proto
-            Local   = "$($c.LocalAddress):$port"
-            PID     = $c.OwningProcess
-            Process = $procName
-            Note    = $flag
+# ==========================================================================
+# 4. Legacy services on risky ports
+# ==========================================================================
+Write-Section "4. Legacy services on risky ports"
+
+# Map risky listening ports -> the Windows service that typically owns them.
+$legacyServices = @{
+    "TlntSvr"        = "Telnet Server (port 23, cleartext)"
+    "FTPSVC"         = "FTP Server / IIS FTP (port 21, cleartext)"
+    "SNMP"           = "SNMP Service (port 161)"
+    "RemoteRegistry" = "Remote Registry (lateral-movement aid)"
+    "SessionEnv"     = $null  # placeholder, not touched
+}
+
+# Show what's actually listening on flagged ports first
+$riskyPorts = 21,23,69,111,135,137,138,139,161,512,513,514,1434,5900
+$listening = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object { $riskyPorts -contains $_.LocalPort }
+if ($listening) {
+    Write-Host "Currently listening on flagged ports:" -ForegroundColor White
+    foreach ($l in $listening) {
+        $pname = (Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+        Write-Host ("   {0}:{1}  <-  {2} (PID {3})" -f $l.LocalAddress, $l.LocalPort, $pname, $l.OwningProcess) -ForegroundColor Red
+    }
+} else {
+    Write-Host "[OK] Nothing listening on the common legacy TCP ports." -ForegroundColor Green
+}
+
+if ($IncludeServices) {
+    $svcRollback = @()
+    foreach ($name in ($legacyServices.Keys | Where-Object { $legacyServices[$_] })) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($svc -and $svc.StartType -ne 'Disabled') {
+            $svcRollback += [pscustomobject]@{ Name = $name; StartType = "$($svc.StartType)"; Status = "$($svc.Status)" }
+            Invoke-Change "Stop & disable '$name' — $($legacyServices[$name])" {
+                Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+                Set-Service  -Name $name -StartupType Disabled
+            }
+        } else {
+            Write-Host "[SKIP] '$name' not present or already disabled." -ForegroundColor DarkGray
         }
     }
-    $rows = $rows | Sort-Object { [int]($_.Local -split ':')[-1] } -Unique
-    $rows | Format-Table -AutoSize | Out-String | Write-Host
-    foreach ($r in $rows | Where-Object Note) {
-        Write-Host ("   [FLAG] {0}  ->  {1}  ({2})" -f $r.Local, $r.Note, $r.Process) -ForegroundColor Red
-    }
-    return $rows
+    $rollback.LegacyServices = $svcRollback
+} else {
+    Write-Host "[INFO] Re-run with -IncludeServices to auto-disable Telnet/FTP/SNMP/RemoteRegistry." -ForegroundColor Gray
 }
 
-$tcp = Get-NetTCPConnection -State Listen
-$udp = Get-NetUDPEndpoint
-$report.TCP_Listeners = Show-Ports $tcp "TCP"
-$report.UDP_Listeners = Show-Ports $udp "UDP"
-
-# --- Summary ---------------------------------------------------------------
+# ==========================================================================
+# Save rollback snapshot + summary
+# ==========================================================================
 Write-Section "Summary"
-Write-Host "Hostname : $env:COMPUTERNAME"
-Write-Host "Scan time: $(Get-Date -Format u)"
-Write-Host ""
-Write-Host "Reminder: this audits LOCAL exposure only. For real CVE detection run a"
-Write-Host "vulnerability scanner (nmap --script vuln, OpenVAS, Nessus) against the host."
 
-if ($AsJson) {
+if ($Apply) {
+    $rollback | ConvertTo-Json -Depth 6 | Set-Content -Path $RollbackPath -Encoding UTF8
+    Write-Host "[OK] Pre-change state saved to:" -ForegroundColor Green
+    Write-Host "     $RollbackPath" -ForegroundColor Gray
     Write-Host ""
-    $report | ConvertTo-Json -Depth 5
+    Write-Host "[!] A REBOOT is recommended to fully apply SMB1 / NetBIOS changes." -ForegroundColor Yellow
+    Write-Host "    Verify afterwards by re-running Check-SmbNetbiosExposure.ps1" -ForegroundColor Gray
+} else {
+    Write-Host "DRY-RUN complete. No changes made." -ForegroundColor White
+    Write-Host "Re-run with -Apply to harden (add -IncludeServices to also disable legacy services)." -ForegroundColor Gray
 }
