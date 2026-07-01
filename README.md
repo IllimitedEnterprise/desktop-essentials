@@ -385,3 +385,6 @@ UNDER DEVELOPMENT
 
 # 3. Also disable legacy services:
 .\Harden-SmbNetbiosExposure.ps1 -Apply -IncludeServices
+
+# Harden AND reboot into the recovery menu afterward:
+.\Harden-SmbNetbiosExposure.ps1 -Apply -RebootToRecovery
