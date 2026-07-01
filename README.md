@@ -375,3 +375,13 @@ $sb.ToString() | Out-File $log -Encoding utf8; "DONE" | Out-File $log -Append -E
 ---
 
 *Generated from a live assessment. Adapt usernames/paths and always confirm destructive scope with the user before executing Sections 2.1 and 3.*
+
+UNDER DEVELOPMENT
+# 1. Preview everything it would do (safe):
+.\Harden-SmbNetbiosExposure.ps1
+
+# 2. Apply core hardening:
+.\Harden-SmbNetbiosExposure.ps1 -Apply
+
+# 3. Also disable legacy services:
+.\Harden-SmbNetbiosExposure.ps1 -Apply -IncludeServices
